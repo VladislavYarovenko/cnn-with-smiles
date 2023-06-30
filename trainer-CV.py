@@ -81,9 +81,9 @@ if args.gpu >= 0:
 #-------------------------------
     # Loading SMILEs
 print('Data loading...')
-file = args.input + '/'+ args.protein + '_all.smiles'
+file = args.input + '/'+ args.protein + '_wholetraining.smiles'
 f.write('Loading TOX21smiles: {0}\n'.format(file))
-smi = Chem.SmilesMolSupplier(file,delimiter='\t',titleLine=False)
+smi = Chem.SmilesMolSupplier(file,delimiter=' ',titleLine=False)
 mols = [mol for mol in smi if mol is not None]
     
     # Make Feature Matrix
