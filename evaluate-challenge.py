@@ -63,7 +63,7 @@ def main():
     print('Making Test Dataset...')
     file=args.data + '/' + args.protein + '_score.smiles'
     print('Loading smiles: ', file)
-    smi = Chem.SmilesMolSupplier(file,delimiter='\t',titleLine=False)
+    smi = Chem.SmilesMolSupplier(file,delimiter=' ',titleLine=False)
     mols = [mol for mol in smi if mol is not None]
     
     F_list, T_list = [],[]
