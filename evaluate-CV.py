@@ -62,7 +62,7 @@ def main():
     
     #-------------------------------
     # Loading SMILEs
-    file=args.data + '/'+ args.protein + '_all.smiles'
+    file=args.data + '/'+ args.protein + '_wholetraining.smiles'
     print('Loading TOX21smiles: ', file)
     smi = Chem.SmilesMolSupplier(file,delimiter=' ',titleLine=False)
     mols = [mol for mol in smi if mol is not None]
