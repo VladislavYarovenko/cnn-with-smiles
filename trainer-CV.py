@@ -1,45 +1,34 @@
-#!/usr/bin/env python 
+#!/usr/bin/env python
 # coding:utf-8
 
-import time, argparse, gc
-
+import time
+import argparse
+import gc
 import numpy as np
-import cupy as cp
 import pandas as pd
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torch.autograd import Variable
 from sklearn import metrics
-
 from rdkit import Chem
-
 from feature import *
 import SCFPfunctions as Mf
 import SCFPmodel as Mm
-
-import chainer
-import chainer.functions as F
-import chainer.links as L
-from chainer import cuda, Function, gradient_check, report, training, utils, Variable
-from chainer import datasets, iterators, optimizers, serializers
-from chainer import Reporter, report, report_scope
-from chainer import Link, Chain, ChainList, training
-from chainer.datasets import tuple_dataset
-from chainer.dataset import concat_examples
-from chainer.training import extensions
-
 import GPy
-import GPyOpt
+import GPyOpt 
 
 #-------------------------------------------------------------
- # featurevectorのサイズ
+# featurevectorのサイズ
 atomInfo = 21
 structInfo = 21
 lensize = atomInfo + structInfo
 #-------------------------------------------------------------
-    
+
 START = time.time()
 
-#-------------------------------
-    #hypterparameter
+#--------------------------
 parser = argparse.ArgumentParser(description='CNN fingerprint')    
 parser.add_argument('--batchsize', '-b', type=int, default=32, help='Number of moleculars in each mini-batch')
 parser.add_argument('--validation', '-v', type=int, default= 5, help='N-fold cross validation')
@@ -66,114 +55,136 @@ parser.add_argument('--n_hid', type=int, default=160, help='No. of hidden percep
 parser.add_argument('--n_out', type=int, default=1, help='No. of output perceptron (class)')
 args = parser.parse_args()
 
+#-------------------------------
+# hypterparameter
 f = open(args.output+'/'+args.protein+'/CV_log.txt', 'w')
 print(args.protein)
 f.write('{0}\n'.format(args.protein))
-    
-  #-------------------------------
-    # GPU check
-xp = np
-if args.gpu >= 0:
-    print('GPU mode...')
-    xp = cp
-    chainer.cuda.get_device_from_id(args.gpu).use()
 
 #-------------------------------
-    # Loading SMILEs
+# GPU check
+device = torch.device("cuda" if torch.cuda.is_available() and args.gpu >= 0 else "cpu")
+
+#-------------------------------
+# Loading SMILEs
 print('Data loading...')
-file = args.input + '/'+ args.protein + '_wholetraining.smiles'
+file = args.input + '/' + args.protein + '_wholetraining.smiles'
 f.write('Loading TOX21smiles: {0}\n'.format(file))
-smi = Chem.SmilesMolSupplier(file,delimiter=' ',titleLine=False)
+smi = Chem.SmilesMolSupplier(file, delimiter=' ', titleLine=False)
 mols = [mol for mol in smi if mol is not None]
-    
-    # Make Feature Matrix
+
+# Make Feature Matrix
 f.write('Make FeatureMatrix...\n')
-F_list, T_list = [],[]
+F_list, T_list = [], []
 for mol in mols:
-    if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize: f.write("too long mol was ignored\n")
+    if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize:
+        f.write("too long mol was ignored\n")
     else:
-        F_list.append(mol_to_feature(mol,-1,args.atomsize))
-        T_list.append(mol.GetProp('_Name') )
-                
-    #-------------------------------    
-    # Setting Dataset to model
+        F_list.append(mol_to_feature(mol, -1, args.atomsize))
+        T_list.append(int(mol.GetProp('_Name')))
+
+#-------------------------------
+# Setting Dataset to model
 f.write("Reshape the Dataset...\n")
 Mf.random_list(F_list)
 Mf.random_list(T_list)
-data_t = cp.asarray(T_list, dtype=cp.int32).reshape(-1,1)
-data_f = cp.asarray(F_list, dtype=cp.float32).reshape(-1,1,args.atomsize,lensize)
+
+data_t = torch.tensor(T_list, dtype=torch.int32).reshape(-1, 1)
+data_f = torch.tensor(F_list, dtype=torch.float32).reshape(-1, 1, args.atomsize, lensize)
 f.write('{0}\t{1}\n'.format(data_t.shape, data_f.shape))
 
 f.write('Validate the Dataset...k ={0}\n'.format(args.validation))
-dataset = datasets.TupleDataset(data_f, data_t)
+dataset = torch.utils.data.TensorDataset(data_f, data_t)
+print(dataset[0])
 if args.validation > 1:
-    dataset = datasets.get_cross_validation_datasets(dataset, args.validation)
-    #dataset = datasets.get_cross_validation_datasets_random(dataset, args.validation)
-    
+    dataset = torch.utils.data.random_split(dataset, [1/args.validation for i in range(args.validation)])
+
 #-------------------------------
-# reset memory
+# Reset memory
 del mol, mols, data_f, data_t, F_list, T_list
 gc.collect()
-#-------------------------------      
+#-------------------------------
 # 5-fold
 print('Training...')
-f.write('Convolutional neural network is  running...\n')
+f.write('Convolutional neural network is running...\n')
 v = 1
 while v <= args.validation:
     print('...{0}'.format(v))
     f.write('Cross-Validation : {0}\n'.format(v))
 
     # Set up a neural network to train
-    model = Mm.CNN(args.atomsize, lensize, args.k1, args.s1, args.f1, args.k2, args.s2, args.k3, args.s3, args.f3,args.k4, args.s4,args.n_hid,args.n_out)
+    model = Mm.CNN(args.atomsize, lensize, args.k1, args.s1, args.f1, args.k2, args.s2, args.k3, args.s3, args.f3,
+                   args.k4, args.s4, args.n_hid, args.n_out)
 
-#-------------------------------
-    # Make a specified GPU current
-    if args.gpu >= 0:
-        chainer.cuda.get_device_from_id(args.gpu).use()
-        model.to_gpu()  # Copy the model to the GPU
+    # Move the model to the device
+    model.to(device)
 
-#-------------------------------
-    # Setup an optimizer
+    # Set up an optimizer
     f.write('Optimizer is setting up...\n')
-    optimizer = chainer.optimizers.Adam()
-    optimizer.setup(model)
+    optimizer = optim.Adam(model.parameters())
 
-#-------------------------------      
+    # Set up a loss function
+    criterion = nn.CrossEntropyLoss()
+
+    #-------------------------------
     # Set up a trainer
     f.write('Trainer is setting up...\n')
-        
-    train_iter = chainer.iterators.SerialIterator(dataset[v-1][0], batch_size= args.batchsize, shuffle=True)
-    test_iter = chainer.iterators.SerialIterator(dataset[v-1][1], batch_size= args.batchsize, repeat=False, shuffle=False)
 
-    updater = training.StandardUpdater(train_iter, optimizer, device=args.gpu)
-    trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=args.output+'/'+args.protein+'/')    
+    train_loader = DataLoader(dataset[v - 1][0], batch_size=args.batchsize, shuffle=True)
+    test_loader = DataLoader(dataset[v - 1][1], batch_size=args.batchsize, shuffle=False)
 
-    # Take a snapshot for each specified epoch
-    frequency = args.epoch if args.frequency == -1 else max(1, args.frequency)
-    trainer.extend(extensions.snapshot_object(model, 'model_'+str(v)+'_snapshot_{.updater.epoch}'), trigger=(frequency,'epoch'))
-    trainer.extend(extensions.snapshot_object(optimizer, 'optimizer_'+str(v)+'_snapshot_{.updater.epoch}'), trigger=(args.epoch,'epoch'))
-    #trainer.extend(extensions.snapshot_object(model, 'model_'+str(v)+'_snapshot_{.updater.iteration}', trigger=(frequency,'iteration')))
-    #trainer.extend(extensions.snapshot_object(optimizer, 'optimizer_'+str(v)+'_snapshot_{.updater.iteration}', trigger=(frequency,'iteration')))
+    # Train the model
+    for epoch in range(args.epoch):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-    # Write a log of evaluation statistics for each epoch    
-    trainer.extend(extensions.LogReport(trigger=(1, 'epoch'), log_name='log_'+str(v)+'_epoch'))
-    trainer.extend(extensions.LogReport(trigger=(10, 'iteration'), log_name='log_'+str(v)+'_iteration'))
+        for inputs, labels in train_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
 
-    # Print selected entries of the log to stdout
-    trainer.extend(extensions.PrintReport( ['epoch', 'elapsed_time',  
-                                            'main/loss', 'validation/main/loss',
-                                          'main/accuracy','validation/main/accuracy',
-                                           ]))
+            optimizer.zero_grad()
 
-# Run the training
-    trainer.run()
-    v = v +1
-    
-    
+            outputs = model(inputs)
+            loss = criterion(outputs, labels.squeeze())
+            loss.backward()
+            optimizer.step()
 
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels.squeeze()).sum().item()
 
+        train_loss = running_loss / len(train_loader)
+        train_accuracy = correct / total
+
+        # Evaluate the model
+        model.eval()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+
+                outputs = model(inputs)
+                loss = criterion(outputs, labels.squeeze())
+
+                running_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels.squeeze()).sum().item()
+
+        test_loss = running_loss / len(test_loader)
+        test_accuracy = correct / total
+
+        print(f"Epoch {epoch + 1}/{args.epoch}: Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, "
+              f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
+
+    v += 1
 
 END = time.time()
 f.write('Nice, your Learning Job is done.\n')
-f.write("Total time is {} sec.\n".format(END-START))
+f.write("Total time is {} sec.\n".format(END - START))
 f.close()
