@@ -1,40 +1,59 @@
-#!/usr/bin/env python 
+#!/usr/bin/env python
 # coding:utf-8
 
-import time, argparse, gc, os
-
+import time
+import argparse
+import os
 import numpy as np
-import cupy as cp
 import pandas as pd
-
+import torch
+from torch.utils.data import Dataset, DataLoader
 from rdkit import Chem
-
 from feature import *
 import SCFPfunctions as Mf
 import SCFPmodel as Mm
 
-# chainer v2
-import chainer
-import chainer.functions as F
-import chainer.links as L
-from chainer import cuda, Function, gradient_check, report, training, utils, Variable
-from chainer import datasets, iterators, optimizers, serializers
-from chainer import Reporter, report, report_scope
-from chainer import Link, Chain, ChainList, training
-from chainer.datasets import tuple_dataset
-from chainer.training import extensions
-
-#-------------------------------------------------------------
- # featurevector size
+# featurevector size
 atomInfo = 21
 structInfo = 21
-lensize= atomInfo + structInfo
+lensize = atomInfo + structInfo
 
-#------------------------------------------------------------- 
+class TupleDataset(Dataset):
+    def __init__(self, *data):
+        assert all(len(d) == len(data[0]) for d in data), "All data should have the same length."
+        self.data = data
+
+    def __len__(self):
+        return len(self.data[0])
+
+    def __getitem__(self, index):
+        return tuple(torch.tensor(d[index]) for d in self.data)
+
+def train_step(batch):
+    model.train()
+    optimizer.zero_grad()
+    inputs, targets = batch
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+    output = model(inputs)
+    loss = F.cross_entropy(output, targets)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+    
+def test_step(batch):
+    model.eval()
+    inputs, targets = batch
+    inputs = inputs.to(device)
+    targets = targets.to(device)
+    output = model(inputs)
+    loss = F.cross_entropy(output, targets)
+    accuracy = torch.mean((torch.argmax(output, dim=1) == targets).float())
+    return loss.item(), accuracy.item()
+
 def main():
-    
     START = time.time()
-    
+
     #--------------------------
     parser = argparse.ArgumentParser(description='SMILES CNN fingerprint')    
     parser.add_argument('--batchsize', '-b', type=int, default=32, help='Number of moleculars in each mini-batch. Default = 32')
@@ -70,107 +89,104 @@ def main():
     print('# max-pooling: ',args.k4, args.s4)
     print('')
     
-  #-------------------------------
+    #-------------------------------
     # GPU check
-    xp = np
-    if args.gpu >= 0:
-        print('GPU mode')
-        xp = cp
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#-------------------------------
-    # Loading SMILEs
-    print('Making Training  Dataset...')
-    file=args.input + '/' + args.protein + '_wholetraining.smiles'
+    #-------------------------------
+    # Loading SMILES
+    print('Making Training Dataset...')
+    file = os.path.join(args.input, args.protein + '_wholetraining.smiles')
     print('Loading smiles: ', file)
-    smi = Chem.SmilesMolSupplier(file,delimiter=' ',titleLine=False)
+    smi = Chem.SmilesMolSupplier(file, delimiter=' ', titleLine=False)
     mols = [mol for mol in smi if mol is not None]
     
-    F_list, T_list = [],[]
+    F_list, T_list = [], []
     for mol in mols:
-        if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize: print("too long mol was ignored")
+        if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize:
+            print("too long mol was ignored")
         else:
-            F_list.append(mol_to_feature(mol,-1,args.atomsize))
-            T_list.append(mol.GetProp('_Name'))
+            F_list.append(mol_to_feature(mol, -1, args.atomsize))
+            T_list.append(int(mol.GetProp('_Name')))
     Mf.random_list(F_list)
     Mf.random_list(T_list)
     
-    data_t = xp.asarray(T_list, dtype=cp.int32).reshape(-1,args.n_out)
-    data_f = xp.asarray(F_list, dtype=cp.float32).reshape(-1,args.n_out,args.atomsize,lensize)
+    data_t = torch.tensor(T_list, dtype=torch.int32).reshape(-1, args.n_out).to(device)
+    data_f = torch.tensor(F_list, dtype=torch.float32).reshape(-1, args.n_out, args.atomsize, lensize).to(device)
     print(data_t.shape, data_f.shape)
-    train_dataset = datasets.TupleDataset(data_f, data_t)
+    train_dataset = TupleDataset(data_f, data_t)
     
     print('Making Scoring Dataset...')
-    ile=args.input + '/' + args.protein + '_score.smiles'
+    file = os.path.join(args.input, args.protein + '_score.smiles')
     print('Loading smiles: ', file)
-    smi = Chem.SmilesMolSupplier(file,delimiter='\t',titleLine=False)
+    smi = Chem.SmilesMolSupplier(file, delimiter='\t', titleLine=False)
     mols = [mol for mol in smi if mol is not None]
     
-    F_list, T_list = [],[]
+    F_list, T_list = [], []
     for mol in mols:
-        if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize: print("SMIELS is too long. This mol will be ignored.")
+        if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize:
+            print("SMILES is too long. This mol will be ignored.")
         else:
-            F_list.append(mol_to_feature(mol,-1,args.atomsize))
+            F_list.append(mol_to_feature(mol, -1, args.atomsize))
             T_list.append(mol.GetProp('_Name'))            
     Mf.random_list(F_list)
     Mf.random_list(T_list)
-    data_t = xp.asarray(T_list, dtype=cp.int32).reshape(-1,1)
-    data_f = xp.asarray(F_list, dtype=cp.float32).reshape(-1,1,args.atomsize,lensize)
+    data_t = torch.tensor(T_list, dtype=torch.int32).reshape(-1, 1).to(device)
+    data_f = torch.tensor(F_list, dtype=torch.float32).reshape(-1, 1, args.atomsize, lensize).to(device)
     print(data_t.shape, data_f.shape)
-    test_dataset = datasets.TupleDataset(data_f, data_t)
+    test_dataset = TupleDataset(data_f, data_t)
     
     #-------------------------------
-    # reset memory
+    # Reset memory
     del mol, mols, data_f, data_t, F_list, T_list
-    gc.collect()
+    torch.cuda.empty_cache()
     
-#-------------------------------      
+    #-------------------------------
     # Set up a neural network to train
-    model = Mm.CNN(args.atomsize, lensize, args.k1, args.s1, args.f1, args.k2, args.s2, args.k3, args.s3, args.f3,args.k4, args.s4,args.n_hid,args.n_out)
-
-    #-------------------------------
-        # Make a specified GPU current
-    if args.gpu >= 0:
-        chainer.cuda.get_device_from_id(args.gpu).use()
-        model.to_gpu()  # Copy the model to the GPU
+    model = Mm.CNN(args.atomsize, lensize, args.k1, args.s1, args.f1, args.k2, args.s2, args.k3, args.s3, args.f3, args.k4, args.s4, args.n_hid, args.n_out).to(device)
     
     #-------------------------------
-        # Setup an optimizer
-    optimizer = chainer.optimizers.Adam()
-    optimizer.setup(model)
-        
-    #-------------------------------      
-        # Set up a trainer
+    # Setup an optimizer
+    optimizer = torch.optim.Adam(model.parameters())
+    
+    #-------------------------------
+    # Set up a trainer
     print('Trainer is setting up...')
     
-    output_dir = args.input+'/'+args.protein
-    os.makedirs(output_dir)
+    output_dir = os.path.join(args.input, args.protein)
+    os.makedirs(output_dir, exist_ok=True)
     
-    train_iter = chainer.iterators.SerialIterator(train_dataset, batch_size= args.batchsize, shuffle=True)
-    test_iter = chainer.iterators.SerialIterator(test_dataset, batch_size= args.batchsize, repeat=False, shuffle=True)
-    updater = training.StandardUpdater(train_iter, optimizer, device=args.gpu)
-    trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=output_dir)
+    train_loader = DataLoader(train_dataset, batch_size=args.batchsize, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=args.batchsize, shuffle=True)
     
-       # Evaluate the model with the test dataset for each epoch
-    trainer.extend(extensions.Evaluator(test_iter, model, device=args.gpu))
-        # Take a snapshot for each specified epoch
-    trainer.extend(extensions.snapshot_object(model, 'model_snapshot_{.updater.epoch}'), trigger=(args.frequency,'epoch'))
-        # Write a log of evaluation statistics for each epoch    
-    trainer.extend(extensions.LogReport(trigger=(1, 'epoch'), log_name='log_epoch'))
-    trainer.extend(extensions.LogReport(trigger=(10, 'iteration'), log_name='log_iteration'))
-        # Print selected entries of the log to stdout
-    trainer.extend(extensions.PrintReport( ['epoch', 'elapsed_time','main/loss', 'validation/main/loss','main/accuracy','validation/main/accuracy']))
-         # Print a progress bar to stdout
-    trainer.extend(extensions.ProgressBar())
     
-    # Run the training
-    trainer.run()
+    for epoch in range(args.epoch):
+        train_loss = 0.0
+        for batch in train_loader:
+            loss = train_step(batch)
+            train_loss += loss
+        
+        train_loss /= len(train_loader)
+        
+        test_loss = 0.0
+        test_accuracy = 0.0
+        with torch.no_grad():
+            for batch in test_loader:
+                loss, accuracy = test_step(batch)
+                test_loss += loss
+                test_accuracy += accuracy
+        
+        test_loss /= len(test_loader)
+        test_accuracy /= len(test_loader)
+        
+        print(f"Epoch [{epoch+1}/{args.epoch}] - Train Loss: {train_loss:.4f} - Test Loss: {test_loss:.4f} - Test Accuracy: {test_accuracy:.4f}")
     
     END = time.time()
-    print('Nice, your Learning Job is done.　Total time is {} sec．'.format(END-START))
-    
-#-------------------------------      
-    # Model Fegure    
+    print('Nice, your Learning Job is done. Total time is {} sec.'.format(END - START))
 
-#------------------------------- 
+#-------------------------------
+# Model Figure
+
+#-------------------------------
 if __name__ == '__main__':
     main()
