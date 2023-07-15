@@ -1,30 +1,20 @@
-#!/usr/bin/env python 
-# coding:utf-8
-
 import argparse
 import gc
 
 import numpy as np
-import cupy as cp
 import pandas as pd
 
 from rdkit import Chem
-#from rdkit.Chem import AllChem
-#from rdkit.Chem import rdchem
 from feature import *
 import SCFPfunctions as Mf
 import SCFPmodel as Mm
 
 from sklearn import metrics
 
-import chainer
-import chainer.functions as F
-import chainer.links as L
-from chainer import cuda, Function, gradient_check, report, training, utils, Variable
-from chainer import datasets, serializers
-from chainer import Link, Chain, ChainList
-from chainer.datasets import tuple_dataset
-from chainer.training import extensions
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+from torch.utils.data import TensorDataset
 
 #-------------------------------------------------------------
 # featurevector size
@@ -58,92 +48,82 @@ def main():
     parser.add_argument('--n_hid', type=int, default=96, help='No. of hidden perceptron. Default = 96')
     
     args = parser.parse_args()
-    
-    #-------------------------------
     print('Making Test Dataset...')
-    file=args.data + '/' + args.protein + '_score.smiles'
+    file = args.data + '/' + args.protein + '_score.smiles'
     print('Loading smiles: ', file)
-    smi = Chem.SmilesMolSupplier(file,delimiter=' ',titleLine=False)
+    smi = Chem.SmilesMolSupplier(file, delimiter=' ', titleLine=False)
     mols = [mol for mol in smi if mol is not None]
-    
-    F_list, T_list = [],[]
+
+    F_list, T_list = [], []
     for mol in mols:
-        if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize: print("too long mol was ignored")
+        if len(Chem.MolToSmiles(mol, kekuleSmiles=True, isomericSmiles=True)) > args.atomsize:
+            print("too long mol was ignored")
         else:
-            F_list.append(mol_to_feature(mol,-1,args.atomsize))
-            T_list.append(mol.GetProp('_Name') )            
+            F_list.append(mol_to_feature(mol, -1, args.atomsize))
+            T_list.append(mol.GetProp('_Name'))
     Mf.random_list(F_list)
     Mf.random_list(T_list)
-    data_t = np.asarray(T_list, dtype=np.int32).reshape(-1,1)
-    data_f = np.asarray(F_list, dtype=np.float32).reshape(-1,1,args.atomsize,lensize)
+    data_t = np.asarray(T_list, dtype=np.int32).reshape(-1, 1)
+    data_f = np.asarray(F_list, dtype=np.float32).reshape(-1, 1, args.atomsize, lensize)
     print(data_t.shape, data_f.shape)
-    borders = [len(data_t) * i // 30 for i in range(30+1)]
-    
-    with cp.cuda.Device(args.gpu):
-        data_f_gpu = cp.array(data_f)
-        data_t_gpu = cp.array(data_t)
+    borders = [len(data_t) * i // 30 for i in range(30 + 1)]
 
-    #-------------------------------
-    # reset memory
+    data_f_gpu = torch.from_numpy(data_f).to(args.device)
+    data_t_gpu = torch.from_numpy(data_t).to(args.device)
+
     del mol, mols, data_f, F_list, T_list
     gc.collect()
-    
-    
-#-------------------------------      
-    print('Evaluater is  running...')
 
-#-------------------------------
-    # Set up a neural network to evaluate
-    model = Mm.CNN(args.atomsize, lensize, args.k1, args.s1, args.f1, args.k2, args.s2, args.k3, args.s3, args.f3,args.k4, args.s4,args.n_hid,args.n_out)
+    print('Evaluator is running...')
+
+    model = Mm.CNN(args.atomsize, lensize, args.k1, args.s1, args.f1, args.k2, args.s2, args.k3, args.s3, args.f3, args.k4, args.s4, args.n_hid, args.n_out)
     model.compute_accuracy = False
-    model.to_gpu(args.gpu)
-    f = open(args.model+'/'+args.protein+'/evaluation_epoch.csv', 'w') 
+    model.to(args.device)
 
-#-------------------------------    
-    print("epoch","TP","FN","FP","TN","Loss","Accuracy","B_accuracy","Sepecificity","Precision","Recall","F-measure","AUC", sep="\t")
-    f.write("epoch,TP,FN,FP,TN,Loss,Accuracy,B_accuracy,Sepecificity,Precision,Recall,F-measure,AUC\n")
+    f = open(args.model + '/' + args.protein + '/evaluation_epoch.csv', 'w')
 
-    for epoch in range(args.frequency, args.epoch+1 ,args.frequency):
-            
-        pred_score,loss =[],[]
-        
-        with cp.cuda.Device(args.gpu):
-            serializers.load_npz(args.model+'/'+args.protein+'/model_snapshot_' + str(epoch), model)
-            
+    print("epoch", "TP", "FN", "FP", "TN", "Loss", "Accuracy", "B_accuracy", "Specificity", "Precision", "Recall", "F-measure", "AUC", sep="\t")
+    f.write("epoch,TP,FN,FP,TN,Loss,Accuracy,B_accuracy,Specificity,Precision,Recall,F-measure,AUC\n")
+
+    for epoch in range(args.frequency, args.epoch + 1, args.frequency):
+        pred_score, loss = [], []
+
+        model.load_state_dict(torch.load(args.model + '/' + args.protein + '/model_snapshot_' + str(epoch)))
+        model.eval()
+
         for i in range(30):
-            with cp.cuda.Device(args.gpu):
-                x_gpu = data_f_gpu[borders[i]:borders[i+1]]
-                y_gpu = data_t_gpu[borders[i]:borders[i+1]]
-                pred_tmp_gpu, sr = model.predict(Variable(x_gpu))
-                pred_tmp_gpu = F.sigmoid(pred_tmp_gpu)
-                pred_tmp = pred_tmp_gpu.data.get()
-                loss_tmp = model(Variable(x_gpu),Variable(y_gpu)).data.get()
+            x = data_f_gpu[borders[i]:borders[i + 1]]
+            y = data_t_gpu[borders[i]:borders[i + 1]]
+            pred_tmp, sr = model.predict(Variable(x))
+            pred_tmp = torch.sigmoid(pred_tmp)
+            pred_tmp = pred_tmp.cpu().data.numpy()
+            loss_tmp = model(Variable(x), Variable(y)).data.item()
             pred_score.extend(pred_tmp.reshape(-1).tolist())
             loss.append(loss_tmp.tolist())
-        
-        
+
         loss = np.mean(loss)
-        pred_score = np.array(pred_score).reshape(-1,1)
-        pred = 1*(pred_score >=0.5)
-        
-        count_TP= np.sum(np.logical_and(data_t == pred, pred == 1)*1)
-        count_FP = np.sum(np.logical_and(data_t != pred, pred == 1)*1)
-        count_FN = np.sum(np.logical_and(data_t != pred, pred == 0)*1)
-        count_TN = np.sum(np.logical_and(data_t == pred, pred == 0)*1)
-            
-        Accuracy = (count_TP + count_TN)/(count_TP+count_FP+count_FN+count_TN)
-        Sepecificity = count_TN/(count_TN + count_FP)
-        Precision = count_TP/(count_TP+count_FP)
-        Recall = count_TP/(count_TP+count_FN)
-        Fmeasure = 2*Recall*Precision/(Recall+Precision)
-        B_accuracy = (Sepecificity+Recall)/2
-        AUC = metrics.roc_auc_score(data_t, pred_score, average = 'weighted')
-        
-        print(epoch,count_TP,count_FN,count_FP,count_TN,loss,Accuracy,B_accuracy,Sepecificity,Precision,Recall,Fmeasure,AUC, sep="\t")
+        pred_score = np.array(pred_score).reshape(-1, 1)
+        pred = 1 * (pred_score >= 0.5)
+
+        count_TP = np.sum(np.logical_and(data_t == pred, pred == 1) * 1)
+        count_FP = np.sum(np.logical_and(data_t != pred, pred == 1) * 1)
+        count_FN = np.sum(np.logical_and(data_t != pred, pred == 0) * 1)
+        count_TN = np.sum(np.logical_and(data_t == pred, pred == 0) * 1)
+
+        Accuracy = (count_TP + count_TN) / (count_TP + count_FP + count_FN + count_TN)
+        Specificity = count_TN / (count_TN + count_FP)
+        Precision = count_TP / (count_TP + count_FP)
+        Recall = count_TP / (count_TP + count_FN)
+        Fmeasure = 2 * Recall * Precision / (Recall + Precision)
+        B_accuracy = (Specificity + Recall) / 2
+        AUC = metrics.roc_auc_score(data_t, pred_score, average='weighted')
+
+        print(epoch, count_TP, count_FN, count_FP, count_TN, loss, Accuracy, B_accuracy, Specificity, Precision, Recall, Fmeasure, AUC, sep="\t")
         text = '{0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12}\n'.format(
-                epoch,count_TP,count_FN,count_FP,count_TN,loss,Accuracy,B_accuracy,Sepecificity,Precision,Recall,Fmeasure,AUC)
+            epoch, count_TP, count_FN, count_FP, count_TN, loss, Accuracy, B_accuracy, Specificity, Precision, Recall,
+            Fmeasure, AUC)
         f.write(text)
-    
+
     f.close()
 
 #------------------------------- 
